@@ -5543,6 +5543,38 @@ function saveCredentials(store) {
   }
 }
 var pending = null;
+function pendingFile() {
+  return path.join(os.homedir(), ".caddy", "pending-login.json");
+}
+function loadPending() {
+  if (pending) return pending;
+  try {
+    const raw = JSON.parse(fs.readFileSync(pendingFile(), "utf8"));
+    if (raw && raw.deviceCode && raw.url) {
+      pending = raw;
+      return pending;
+    }
+  } catch {
+  }
+  return null;
+}
+function savePending(p) {
+  pending = p;
+  const file = pendingFile();
+  if (p === null) {
+    try {
+      fs.unlinkSync(file);
+    } catch {
+    }
+    return;
+  }
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(p), { mode: 384 });
+  try {
+    fs.chmodSync(file, 384);
+  } catch {
+  }
+}
 async function graphLogin(a) {
   const url = (resolvePortal(a.portal) || loadCredentials()?.url || DEFAULT_PORTAL).replace(/\/+$/, "");
   const label = a.label || os.hostname();
@@ -5553,7 +5585,7 @@ async function graphLogin(a) {
   });
   if (!r.ok) throw new Error(`portal /api/device/code returned ${r.status}`);
   const d = await r.json();
-  pending = {
+  savePending({
     url,
     deviceCode: d.device_code,
     userCode: d.user_code,
@@ -5561,7 +5593,7 @@ async function graphLogin(a) {
     interval: d.interval || 5,
     expiresAt: Date.now() + (d.expires_in || 600) * 1e3,
     lastPollAt: 0
-  };
+  });
   return {
     status: "waiting_for_authorization",
     authorize_url: d.verification_uri_complete,
@@ -5580,26 +5612,28 @@ async function graphAuthStatus(a = {}) {
   return result;
 }
 async function pollAuthOnce() {
-  if (!pending) {
+  const p = loadPending();
+  if (!p) {
     const creds = loadCredentials();
     return creds ? { status: "authenticated", url: creds.url, orgs: Object.keys(creds.orgs) } : { status: "no_pending_login", hint: "Run graph_login first." };
   }
-  if (Date.now() > pending.expiresAt) {
-    pending = null;
+  if (Date.now() > p.expiresAt) {
+    savePending(null);
     return { status: "expired", hint: "The code expired. Run graph_login again." };
   }
-  const wait = pending.lastPollAt + pending.interval * 1e3 - Date.now();
+  const wait = p.lastPollAt + p.interval * 1e3 - Date.now();
   if (wait > 0) await new Promise((res) => setTimeout(res, wait));
-  pending.lastPollAt = Date.now();
-  const r = await fetch(`${pending.url}/api/device/token`, {
+  p.lastPollAt = Date.now();
+  savePending(p);
+  const r = await fetch(`${p.url}/api/device/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "application/json" },
-    body: JSON.stringify({ device_code: pending.deviceCode })
+    body: JSON.stringify({ device_code: p.deviceCode })
   });
   const d = await r.json().catch(() => ({}));
   if (r.ok && d.orgs) {
     const existing = loadCredentials();
-    const url = pending.url;
+    const url = p.url;
     const store = {
       url,
       // Merge with existing grants for the same portal; a different portal replaces the store.
@@ -5607,7 +5641,7 @@ async function pollAuthOnce() {
       obtained_at: (/* @__PURE__ */ new Date()).toISOString()
     };
     saveCredentials(store);
-    pending = null;
+    savePending(null);
     return { status: "authenticated", url: store.url, orgs: Object.keys(store.orgs), store: credentialsFile() };
   }
   switch (d.error) {
@@ -5615,18 +5649,18 @@ async function pollAuthOnce() {
     case "slow_down":
       return {
         status: "waiting_for_authorization",
-        authorize_url: pending.verificationUri,
-        user_code: pending.userCode,
-        expires_in_seconds: Math.max(0, Math.round((pending.expiresAt - Date.now()) / 1e3))
+        authorize_url: p.verificationUri,
+        user_code: p.userCode,
+        expires_in_seconds: Math.max(0, Math.round((p.expiresAt - Date.now()) / 1e3))
       };
     case "expired_token":
-      pending = null;
+      savePending(null);
       return { status: "expired", hint: "The code expired. Run graph_login again." };
     case "access_denied":
-      pending = null;
+      savePending(null);
       return { status: "denied", hint: "The request was denied in the portal." };
     default:
-      pending = null;
+      savePending(null);
       return { status: "error", error: d.error || `HTTP ${r.status}` };
   }
 }

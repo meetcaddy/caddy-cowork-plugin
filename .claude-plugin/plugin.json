@@ -1,0 +1,16 @@
+{
+  "name": "caddy-cowork",
+  "version": "0.1.0",
+  "description": "Caddy for Cowork — the caddy-mcp graph server and the Caddy Agent skill in one install",
+  "author": {
+    "name": "Meet Caddy",
+    "url": "https://github.com/meetcaddy"
+  },
+  "repository": "https://github.com/meetcaddy/caddy-cowork-plugin",
+  "mcpServers": {
+    "caddy": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/caddy-mcp.cjs"]
+    }
+  }
+}

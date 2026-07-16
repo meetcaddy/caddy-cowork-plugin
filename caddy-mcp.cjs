@@ -5570,7 +5570,16 @@ async function graphLogin(a) {
     instructions: "Surface authorize_url for the user to click (their code is prefilled; they log in, pick which orgs to grant, approve). Then call graph_auth_status until it reports authenticated."
   };
 }
-async function graphAuthStatus() {
+async function graphAuthStatus(a = {}) {
+  const waitMs = Math.min(Math.max(a.wait_seconds ?? 0, 0), 570) * 1e3;
+  const deadline = Date.now() + waitMs;
+  let result = await pollAuthOnce();
+  while (result.status === "waiting_for_authorization" && Date.now() < deadline) {
+    result = await pollAuthOnce();
+  }
+  return result;
+}
+async function pollAuthOnce() {
   if (!pending) {
     const creds = loadCredentials();
     return creds ? { status: "authenticated", url: creds.url, orgs: Object.keys(creds.orgs) } : { status: "no_pending_login", hint: "Run graph_login first." };
@@ -6784,7 +6793,7 @@ var TOOLS = [
   { name: "package_install", description: "Install or update one entitled package into the Cowork project. The portal streams the content from our private repos server-side \u2014 no GitHub credential ever reaches this machine. Unpacks into <project>/.claude/skills/<slug> (or plugins/<slug> per the product), replacing any prior version; records the installed SHA in .claude/caddy-packages.json. Skips the download when already current (pass force to reinstall).", inputSchema: { type: "object", properties: { product: { type: "string", description: "Product slug from packages_list" }, org: { type: "string" }, project_dir: { type: "string", description: "Cowork project folder (defaults to cwd)" }, target_dir: { type: "string", description: "Override the install location" }, force: { type: "boolean", description: "Reinstall even when current" } }, required: ["product"] } },
   { name: "packages_sync", description: "Make this project match the portal entitlements: install every assigned package that's missing and update every stale one. Reports orphans (installed but no longer entitled) without deleting them. Pass dry_run to see the plan without applying. Run after onboarding or when the team assigns you something new.", inputSchema: { type: "object", properties: { org: { type: "string" }, project_dir: { type: "string", description: "Cowork project folder (defaults to cwd)" }, dry_run: { type: "boolean", description: "Report the plan without installing" } }, required: [] } },
   { name: "graph_login", description: "Connect this machine to the graph-portal via device-code login. Returns a click-URL (code prefilled) to surface to the user; they log in, pick which orgs to grant, and approve. Then call graph_auth_status until it reports authenticated. Credentials are tool-managed \u2014 no files or env vars to set.", inputSchema: { type: "object", properties: { portal: { type: "string", description: 'Portal target: "prod" or "dev" (named environments), or a full base URL. Sticky \u2014 the portal you authenticate against becomes the default for graph_pull/refresh until you log into a different one. Defaults to the previously connected portal, else prod (CADDY_PORTAL env overrides).' }, label: { type: "string", description: "Device label shown on the approval page (defaults to hostname)" } }, required: [] } },
-  { name: "graph_auth_status", description: "Check whether a pending graph_login has been approved yet. On approval it saves the credential store and reports the connected orgs.", inputSchema: { type: "object", properties: {}, required: [] } },
+  { name: "graph_auth_status", description: "Check whether a pending graph_login has been approved yet. On approval it saves the credential store and reports the connected orgs. Pass wait_seconds (recommended: 120) to LONG-POLL inside this one call \u2014 surface the login link, then call this immediately with wait_seconds and the flow rides straight through the user's browser approval with no turn break. Repeat while it returns waiting_for_authorization.", inputSchema: { type: "object", properties: { wait_seconds: { type: "number", description: "Block up to this many seconds waiting for the approval (capped at 570). Omit for a single instant check." } }, required: [] } },
   { name: "notion_authorize", description: "Start a one-time Notion OAuth authorization for a project. Returns a click-URL to surface to the user; on their approval it captures the callback and saves the access token (.notion-token) in the project. Runs the listener on the local machine. Use once per workspace (or after rotating the OAuth app).", inputSchema: { type: "object", properties: { project_dir: { type: "string", description: "Project folder to save the token into (Windows or WSL path)" }, client_id: { type: "string" }, client_secret: { type: "string" } }, required: ["project_dir"] } },
   { name: "notion_auth_status", description: "Check whether a pending notion_authorize has completed (token saved) yet.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "generate_notion_graph", description: "Generate or refresh a Notion workspace graph on the LOCAL machine into a project folder, using the saved OAuth token (.notion-token). Overwrites graphs/notion-<workspace>.nq (live-added knowledge is safe in the .local.nq overlay). For STANDALONE local pipelines only \u2014 portal-connected setups schedule refreshes in the portal (Connections, Auto-refresh) and use graph_pull; do not run local generation crons against a portal-managed org. Returns auth_required if no token yet (call notion_authorize first).", inputSchema: { type: "object", properties: { project_dir: { type: "string" }, content: { type: "boolean", description: "Full content depth (records + page text). Default true." }, token_file: { type: "string" } }, required: ["project_dir"] } },
@@ -6821,7 +6830,7 @@ async function main() {
       else if (name === "package_install") result = await packageInstall(a);
       else if (name === "packages_sync") result = await packagesSync(a);
       else if (name === "graph_login") result = await graphLogin(a);
-      else if (name === "graph_auth_status") result = await graphAuthStatus();
+      else if (name === "graph_auth_status") result = await graphAuthStatus(args ?? {});
       else if (name === "notion_authorize") result = notionAuthorize(a);
       else if (name === "notion_auth_status") result = notionAuthStatus();
       else if (name === "generate_notion_graph") result = await generateNotionGraph(a);

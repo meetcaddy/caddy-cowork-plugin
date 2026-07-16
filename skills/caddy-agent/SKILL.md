@@ -108,6 +108,21 @@ All specifics live in `context/install-config.md` — the graph file path, the o
 3. **Not connected?** → this is a fresh install. Switch to the `onboard` workflow and guide the user through it. Do not present an error; present the next step.
 </setup>
 
+<portal-targets>
+Two portal environments exist. The target is chosen ONLY at `graph_login` — after a successful login it is sticky: `graph_pull`, `graph_refresh`, and packages all follow the portal saved in the credential store until the next `graph_login` replaces it.
+
+| Target | Login call | Hostname |
+|--------|-----------|----------|
+| Production (default) | `graph_login` with `portal: "prod"` or no portal arg | portal-production-e91b.up.railway.app |
+| Dev / testing | `graph_login` with `portal: "dev"` | portal-dev-3b3b.up.railway.app |
+
+Non-negotiable rules:
+1. When the user says "dev", "dev portal", or "test portal" → pass `portal: "dev"` explicitly on `graph_login`. Never rely on the default to land on dev; the default is production.
+2. **Before surfacing any authorize link, state which environment it points at** — read the hostname (`portal-dev-…` vs `portal-production-…`) and say "this login targets the DEV portal" or "this login targets PRODUCTION". The user must never have to parse the URL to know.
+3. To flip environments: run `graph_login` again with the other target, complete the approval in the browser, then `graph_pull`. Credentials for the previous portal are replaced, not merged — dev and prod tokens never mix.
+4. **On every fresh login (no stored credentials), ASK the user before minting a code — every time, no exceptions:** "Which portal — dev or production? (If you're not sure, it's production.)" Then pass their answer explicitly. Never call `graph_login` without a portal argument on a fresh login. The user should never need to remember to announce their environment; the question comes to them.
+</portal-targets>
+
 <data-tasks>
 Every command runs the same read loop against the local graph:
 
@@ -128,7 +143,7 @@ Proactive first-run customer success. The user just installed the plugin; assume
 
 1. **Welcome + state check.** Confirm the caddy-mcp tools are present (call `graph_auth_status`). If tools are missing, the plugin isn't fully loaded — tell the user to restart their session, and stop there.
 2. **Already connected?** If `graph_auth_status` reports authenticated, skip to step 4.
-3. **Portal login.** Call `graph_login` — pass `portal: "dev"` or `portal: "prod"` when the operator names a target (prod is the default; the portal authenticated against stays the default for pull/refresh until they flip again). Surface the `authorize_url` prominently — one line, one link, tell them their code is prefilled and they're choosing which orgs this device may read. Then poll `graph_auth_status` until it reports authenticated (it saves credentials itself). If it expires or is denied, say so plainly and offer to mint a fresh code.
+3. **Portal login.** First ask: "Which portal — dev or production? (If you're not sure, it's production.)" — always, per `<portal-targets>` rule 4, unless the user already named one this conversation. Pass the answer explicitly (`portal: "dev"` or `portal: "prod"`). Call `graph_login`, **announce which environment the link targets** ("this login targets the DEV portal"), then surface the `authorize_url` prominently — one line, one link, their code is prefilled, they're choosing which orgs this device may read. Then poll `graph_auth_status` until it reports authenticated (it saves credentials itself). If it expires or is denied, say so plainly and offer to mint a fresh code.
 4. **Pull the graph.** Call `graph_pull` (pass `org` if the user granted more than one). Handle the hints the server returns: `auth_required` → back to step 3; `org_required` → ask which org; `not_shared` → tell them their seat hasn't been granted that graph and who to ask (their org admin).
 5. **Verify + orient.** Run `graphq schema` on the pulled graph. Show what their graph holds — entity types with counts, in their business's own language — and offer three example questions they could ask right now, drawn from the actual classes present (e.g. if `Decision` and `Client` exist: "what did we decide about {a real client's} contract?").
 6. **Leave them moving.** Close with the two commands they'll use daily: `ask` and `search`. Record the graph path and brand label in `context/install-config.md` if they differ from defaults.

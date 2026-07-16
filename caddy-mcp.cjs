@@ -5512,7 +5512,16 @@ var path2 = __toESM(require("path"));
 var fs = __toESM(require("fs"));
 var os = __toESM(require("os"));
 var path = __toESM(require("path"));
-var DEFAULT_PORTAL = "https://portal-production-e91b.up.railway.app";
+var PORTALS = {
+  prod: "https://portal-production-e91b.up.railway.app",
+  production: "https://portal-production-e91b.up.railway.app",
+  dev: "https://portal-dev-3b3b.up.railway.app"
+};
+var DEFAULT_PORTAL = process.env.CADDY_PORTAL || PORTALS.prod;
+function resolvePortal(input) {
+  if (!input) return void 0;
+  return PORTALS[input.toLowerCase().trim()] || input;
+}
 function credentialsFile() {
   return path.join(os.homedir(), ".caddy", "credentials.json");
 }
@@ -5535,7 +5544,7 @@ function saveCredentials(store) {
 }
 var pending = null;
 async function graphLogin(a) {
-  const url = (a.portal || loadCredentials()?.url || DEFAULT_PORTAL).replace(/\/+$/, "");
+  const url = (resolvePortal(a.portal) || loadCredentials()?.url || DEFAULT_PORTAL).replace(/\/+$/, "");
   const label = a.label || os.hostname();
   const r = await fetch(`${url}/api/device/code`, {
     method: "POST",
@@ -6774,7 +6783,7 @@ var TOOLS = [
   { name: "packages_list", description: "List the products/packages this seat is entitled to on the portal, with current version (commit SHA) and local install state. The catalog is entitlement-scoped: only assigned packages appear.", inputSchema: { type: "object", properties: { org: { type: "string", description: "Org slug (optional when exactly one org is connected)" }, project_dir: { type: "string", description: "Cowork project folder (for install-state; defaults to cwd)" } }, required: [] } },
   { name: "package_install", description: "Install or update one entitled package into the Cowork project. The portal streams the content from our private repos server-side \u2014 no GitHub credential ever reaches this machine. Unpacks into <project>/.claude/skills/<slug> (or plugins/<slug> per the product), replacing any prior version; records the installed SHA in .claude/caddy-packages.json. Skips the download when already current (pass force to reinstall).", inputSchema: { type: "object", properties: { product: { type: "string", description: "Product slug from packages_list" }, org: { type: "string" }, project_dir: { type: "string", description: "Cowork project folder (defaults to cwd)" }, target_dir: { type: "string", description: "Override the install location" }, force: { type: "boolean", description: "Reinstall even when current" } }, required: ["product"] } },
   { name: "packages_sync", description: "Make this project match the portal entitlements: install every assigned package that's missing and update every stale one. Reports orphans (installed but no longer entitled) without deleting them. Pass dry_run to see the plan without applying. Run after onboarding or when the team assigns you something new.", inputSchema: { type: "object", properties: { org: { type: "string" }, project_dir: { type: "string", description: "Cowork project folder (defaults to cwd)" }, dry_run: { type: "boolean", description: "Report the plan without installing" } }, required: [] } },
-  { name: "graph_login", description: "Connect this machine to the graph-portal via device-code login. Returns a click-URL (code prefilled) to surface to the user; they log in, pick which orgs to grant, and approve. Then call graph_auth_status until it reports authenticated. Credentials are tool-managed \u2014 no files or env vars to set.", inputSchema: { type: "object", properties: { portal: { type: "string", description: "Portal base URL (defaults to the production portal, or the previously connected one)" }, label: { type: "string", description: "Device label shown on the approval page (defaults to hostname)" } }, required: [] } },
+  { name: "graph_login", description: "Connect this machine to the graph-portal via device-code login. Returns a click-URL (code prefilled) to surface to the user; they log in, pick which orgs to grant, and approve. Then call graph_auth_status until it reports authenticated. Credentials are tool-managed \u2014 no files or env vars to set.", inputSchema: { type: "object", properties: { portal: { type: "string", description: 'Portal target: "prod" or "dev" (named environments), or a full base URL. Sticky \u2014 the portal you authenticate against becomes the default for graph_pull/refresh until you log into a different one. Defaults to the previously connected portal, else prod (CADDY_PORTAL env overrides).' }, label: { type: "string", description: "Device label shown on the approval page (defaults to hostname)" } }, required: [] } },
   { name: "graph_auth_status", description: "Check whether a pending graph_login has been approved yet. On approval it saves the credential store and reports the connected orgs.", inputSchema: { type: "object", properties: {}, required: [] } },
   { name: "notion_authorize", description: "Start a one-time Notion OAuth authorization for a project. Returns a click-URL to surface to the user; on their approval it captures the callback and saves the access token (.notion-token) in the project. Runs the listener on the local machine. Use once per workspace (or after rotating the OAuth app).", inputSchema: { type: "object", properties: { project_dir: { type: "string", description: "Project folder to save the token into (Windows or WSL path)" }, client_id: { type: "string" }, client_secret: { type: "string" } }, required: ["project_dir"] } },
   { name: "notion_auth_status", description: "Check whether a pending notion_authorize has completed (token saved) yet.", inputSchema: { type: "object", properties: {}, required: [] } },

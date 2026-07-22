@@ -1,6 +1,6 @@
 {
   "name": "caddy-cowork",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "description": "Caddy for Cowork — the caddy-mcp graph server and the Caddy Agent skill in one install",
   "author": {
     "name": "Meet Caddy",

@@ -13,7 +13,7 @@
       "name": "caddy-cowork",
       "source": "./",
       "description": "Caddy for Cowork — the caddy-mcp graph server and the Caddy Agent skill in one install: portal login, company knowledge graph, grounded cited answers",
-      "version": "0.2.6",
+      "version": "0.2.7",
       "author": {
         "name": "Meet Caddy"
       }

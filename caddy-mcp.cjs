@@ -6910,7 +6910,7 @@ var TOOLS = [
   { name: "generate_notion_status", description: "Check the progress/result of a generate_notion_graph refresh (which runs in the background because a full content pull takes minutes). Returns running / done (with summary) / failed.", inputSchema: { type: "object", properties: { project_dir: { type: "string" } }, required: ["project_dir"] } }
 ];
 async function main() {
-  const server = new Server({ name: "caddy-mcp", version: "0.4.5" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "caddy-mcp", version: "0.4.6" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;

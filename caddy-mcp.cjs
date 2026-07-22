@@ -5097,7 +5097,7 @@ var Protocol = class {
    */
   request(request, resultSchema, options) {
     const { relatedRequestId, resumptionToken, onresumptiontoken } = options !== null && options !== void 0 ? options : {};
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve2, reject) => {
       var _a, _b, _c, _d, _e, _f;
       if (!this._transport) {
         reject(new Error("Not connected"));
@@ -5148,7 +5148,7 @@ var Protocol = class {
         }
         try {
           const result = resultSchema.parse(response.result);
-          resolve(result);
+          resolve2(result);
         } catch (error) {
           reject(error);
         }
@@ -5483,12 +5483,12 @@ var StdioServerTransport = class {
     (_a = this.onclose) === null || _a === void 0 ? void 0 : _a.call(this);
   }
   send(message) {
-    return new Promise((resolve) => {
+    return new Promise((resolve2) => {
       const json = serializeMessage(message);
       if (this._stdout.write(json)) {
-        resolve();
+        resolve2();
       } else {
-        this._stdout.once("drain", resolve);
+        this._stdout.once("drain", resolve2);
       }
     });
   }
@@ -5822,10 +5822,25 @@ async function remotePullAll() {
 var path3 = __toESM(require("path"));
 var NOTION_BUNDLE = path3.join(__dirname, "notion-snapshot.cjs");
 var PORT = parseInt(process.env.NOTION_OAUTH_PORT || "8735", 10);
+var IS_WSL = process.platform === "linux" && (!!process.env.WSL_DISTRO_NAME || (() => {
+  try {
+    return fs3.readFileSync("/proc/version", "utf-8").toLowerCase().includes("microsoft");
+  } catch {
+    return false;
+  }
+})());
 function toWslPath(p) {
+  if (!IS_WSL) return p;
   const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
   if (m) return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}`;
   return p;
+}
+function isUnscannable(dir) {
+  const norm = path3.resolve(dir);
+  if (norm === path3.parse(norm).root) return true;
+  if (process.platform !== "win32") return false;
+  const windir = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  return norm.toLowerCase().startsWith(path3.resolve(windir).toLowerCase());
 }
 function readToken(tokenFile) {
   if (!fs3.existsSync(tokenFile)) return null;
@@ -6070,7 +6085,7 @@ function stateKey(slug, provider) {
   return `${slug}:${provider}`;
 }
 function mapsDir(a) {
-  const root = a.project_dir ? toWslPath(a.project_dir) : process.cwd();
+  const root = a.project_dir ? toWslPath(a.project_dir) : isUnscannable(process.cwd()) ? path5.join(require("os").homedir(), ".caddy") : process.cwd();
   return path5.join(root, "graphs");
 }
 function timestamp() {
@@ -6741,8 +6756,8 @@ var cache = /* @__PURE__ */ new Map();
 function graphDirs() {
   const env = process.env.GRAPH_DIR;
   if (env) return env.split(path7.delimiter).filter(Boolean);
-  const dirs = [process.cwd(), path7.join(process.cwd(), "graphs")];
-  if (hasCredentials()) {
+  const dirs = [process.cwd(), path7.join(process.cwd(), "graphs")].filter((d) => !isUnscannable(d));
+  if (hasCredentials() || dirs.length === 0) {
     dirs.push(path7.join(require("os").homedir(), ".caddy", "graphs"));
   }
   return dirs;
@@ -6750,23 +6765,31 @@ function graphDirs() {
 function discover() {
   const found = [];
   const seen = /* @__PURE__ */ new Set();
+  const listDir = (dir) => {
+    try {
+      return fs6.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  };
   const scan = (dir) => {
-    if (!fs6.existsSync(dir)) return;
-    for (const f of fs6.readdirSync(dir)) {
+    for (const f of listDir(dir)) {
       if (!f.endsWith(".nq")) continue;
       if (f.endsWith(".local.nq") || /\.v\d+\.nq$/.test(f)) continue;
       const full = path7.join(dir, f);
       if (seen.has(full)) continue;
-      seen.add(full);
-      const st = fs6.statSync(full);
-      found.push({ name: f, path: full, sizeKB: Math.round(st.size / 1024), modified: st.mtime.toISOString() });
+      try {
+        const st = fs6.statSync(full);
+        seen.add(full);
+        found.push({ name: f, path: full, sizeKB: Math.round(st.size / 1024), modified: st.mtime.toISOString() });
+      } catch {
+      }
     }
   };
   for (const dir of graphDirs()) {
     scan(dir);
     scan(path7.join(dir, "graphs"));
-    if (!fs6.existsSync(dir)) continue;
-    for (const sub of fs6.readdirSync(dir)) {
+    for (const sub of listDir(dir)) {
       const subPath = path7.join(dir, sub);
       try {
         if (!fs6.statSync(subPath).isDirectory()) continue;

@@ -5835,6 +5835,30 @@ function toWslPath(p) {
   if (m) return `/mnt/${m[1].toLowerCase()}/${m[2].replace(/\\/g, "/")}`;
   return p;
 }
+var COWORK_SHARED_ROOTS = ["/mnt/user-data", "/mnt/session"];
+var COWORK_WRITABLE_DIRS = ["/mnt/user-data/working", "/mnt/session/outputs"];
+function coworkSharedDir() {
+  for (const dir of COWORK_WRITABLE_DIRS) {
+    try {
+      if (fs3.statSync(dir).isDirectory()) return dir;
+    } catch {
+    }
+  }
+  return null;
+}
+function isCoworkShared(dir) {
+  const norm = path3.resolve(dir);
+  return COWORK_SHARED_ROOTS.some((root) => norm === root || norm.startsWith(`${root}/`));
+}
+function resolveArtifactDir(projectDir, fallback) {
+  const shared = coworkSharedDir();
+  const requested = projectDir ? toWslPath(projectDir) : null;
+  if (requested) {
+    if (!shared || isCoworkShared(requested)) return { dir: requested };
+    return { dir: shared, redirectedFrom: requested };
+  }
+  return { dir: shared || fallback };
+}
 function isUnscannable(dir) {
   const norm = path3.resolve(dir);
   if (norm === path3.parse(norm).root) return true;
@@ -6008,7 +6032,8 @@ var active = /* @__PURE__ */ new Map();
 var POLL_MS = 1e4;
 var TIMEOUT_MS = 30 * 6e4;
 function destFor(a) {
-  return a.project_dir ? path4.join(toWslPath(a.project_dir), "graphs") : void 0;
+  if (!a.project_dir && !coworkSharedDir()) return void 0;
+  return path4.join(resolveArtifactDir(a.project_dir, "").dir, "graphs");
 }
 async function graphRefresh(a) {
   const creds = loadCredentials();
@@ -6120,9 +6145,12 @@ function pruneMatcher(prefix) {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`^${escaped}\\d{8}-\\d{6}\\.nq$`);
 }
+function mapsRoot(a) {
+  const fallback = isUnscannable(process.cwd()) ? path5.join(require("os").homedir(), ".caddy") : process.cwd();
+  return resolveArtifactDir(a.project_dir, fallback);
+}
 function mapsDir(a) {
-  const root = a.project_dir ? toWslPath(a.project_dir) : isUnscannable(process.cwd()) ? path5.join(require("os").homedir(), ".caddy") : process.cwd();
-  return path5.join(root, "graphs");
+  return path5.join(mapsRoot(a).dir, "graphs");
 }
 function timestamp() {
   return (/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
@@ -6835,6 +6863,8 @@ function graphDirs() {
   const env = process.env.GRAPH_DIR;
   if (env) return env.split(path7.delimiter).filter(Boolean);
   const dirs = [process.cwd(), path7.join(process.cwd(), "graphs")].filter((d) => !isUnscannable(d));
+  const shared = coworkSharedDir();
+  if (shared) dirs.unshift(shared, path7.join(shared, "graphs"));
   if (hasCredentials() || dirs.length === 0) {
     dirs.push(path7.join(require("os").homedir(), ".caddy", "graphs"));
   }
@@ -6940,7 +6970,7 @@ var TOOLS = [
   { name: "graph_pull", description: "Sync an org graph from the connected graph-portal. Version-checked: downloads only when the portal has a newer version than the local copy. Auth comes from the device-login store (run graph_login once per machine); returns auth_required when not connected or credentials were revoked. The portal is PASS-THROUGH (no data at rest): refresh_required means it holds no copy \u2014 run graph_refresh to generate and land a fresh one. Pass project_dir to pull into the Cowork project's graphs/ folder instead of the machine cache. Pass kind for an explicitly shared source graph (e.g. notion) \u2014 not_shared when your seat lacks access. Run at session start or when the graph feels stale.", inputSchema: { type: "object", properties: { force: { type: "boolean", description: "Re-download even when versions match" }, org: { type: "string", description: "Org slug to pull (optional when exactly one org is connected)" }, kind: { type: "string", description: "Graph kind: company (default) or a shared source kind like notion" }, project_dir: { type: "string", description: "Cowork project folder \u2014 the graph lands in <project_dir>/graphs (Windows or WSL path)" } }, required: [] } },
   { name: "graph_refresh", description: "Generate a FRESH COMPANY graph (base.nq \u2014 the org's curated union of connected sources) and land it in the project. OWNER territory: only the org Primary (or a delegated seat) may trigger it; other seats get not_permitted \u2014 they use account_map_refresh for their own maps, and graph_pull to receive the company graph the owner generated. Pass-through: the portal extracts, streams here, and deletes its copy. Runs minutes in the background \u2014 poll graph_refresh_status.", inputSchema: { type: "object", properties: { org: { type: "string", description: "Org slug (optional when exactly one org is connected)" }, project_dir: { type: "string", description: "Cowork project folder \u2014 the fresh graph lands in <project_dir>/graphs (recommended; omit to use the machine cache)" } }, required: [] } },
   { name: "graph_refresh_status", description: "Progress of a graph_refresh: generating (portal extracting) \u2192 downloading \u2192 done (graph in place, with file/version) or failed (with detail).", inputSchema: { type: "object", properties: { org: { type: "string", description: "Org slug (optional when exactly one org is connected)" } }, required: [] } },
-  { name: "account_map_refresh", description: `Generate a single-platform graph and land it in the project's graphs/ folder. scope "personal" (the default) maps YOUR OWN platform login \u2014 connected on the portal's Connections page under "Your account" \u2014 so it covers what YOU can see, separate from the company graph; any seat may run it, and not_connected means connect your own account in the portal first. scope "company" maps the ORG's connection instead: the platform graph (e.g. the monday-specific graph), which is still NOT the company graph \u2014 that one is the curated union of every source, pulled with graph_pull. One company connection can serve several named platform graphs ("Sales", "Ops"): pass profile to pick one; omit it for the Default. unknown_profile means that name isn't on the connection \u2014 check the portal's curation page. Company scope needs permission on the portal: not_permitted means ask the org owner, or fall back to scope "personal". Runs minutes in the background \u2014 poll account_map_status with the same scope and profile.`, inputSchema: { type: "object", properties: { provider: { type: "string", description: "Platform: notion, monday, highlevel" }, scope: { type: "string", enum: ["personal", "company"], description: "personal (default) = your own login; company = the org's connection (the platform graph), requires permission" }, profile: { type: "string", description: 'Company scope only: which named platform graph on the connection (e.g. "sales"). Defaults to "default". Ignored for personal scope.' }, org: { type: "string", description: "Org slug (optional when exactly one org is connected)" }, project_dir: { type: "string", description: "Cowork project folder (recommended; defaults to cwd)" } }, required: ["provider"] } },
+  { name: "account_map_refresh", description: `Generate a single-platform graph and land it in the project's graphs/ folder. scope "personal" (the default) maps YOUR OWN platform login \u2014 connected on the portal's Connections page under "Your account" \u2014 so it covers what YOU can see, separate from the company graph; any seat may run it, and not_connected means connect your own account in the portal first. scope "company" maps the ORG's connection instead: the platform graph (e.g. the monday-specific graph), which is still NOT the company graph \u2014 that one is the curated union of every source, pulled with graph_pull. One company connection can serve several named platform graphs ("Sales", "Ops"): pass profile to pick one; omit it for the Default. unknown_profile means that name isn't on the connection \u2014 check the portal's curation page. Company scope needs permission on the portal: not_permitted means ask the org owner, or fall back to scope "personal". Runs minutes in the background \u2014 poll account_map_status with the same scope and profile.`, inputSchema: { type: "object", properties: { provider: { type: "string", description: "Platform: notion, monday, highlevel" }, scope: { type: "string", enum: ["personal", "company"], description: "personal (default) = your own login; company = the org's connection (the platform graph), requires permission" }, profile: { type: "string", description: 'Company scope only: which named platform graph on the connection (e.g. "sales"). Defaults to "default". Ignored for personal scope.' }, org: { type: "string", description: "Org slug (optional when exactly one org is connected)" }, project_dir: { type: "string", description: "The working folder your Bash tool sees (run pwd). Omit it under Cowork and the map lands in the session's shared folder automatically, which is what you want \u2014 a private path like /home/claude is NOT shared with Bash, so a map written there cannot be queried." } }, required: ["provider"] } },
   { name: "account_map_status", description: "Progress of an account_map_refresh: generating \u2192 downloading \u2192 done (file in place) or failed (with detail). Pass the SAME scope AND profile you refreshed with \u2014 personal, company, and each company profile track separately.", inputSchema: { type: "object", properties: { provider: { type: "string" }, scope: { type: "string", enum: ["personal", "company"], description: "Defaults to personal \u2014 must match the refresh" }, profile: { type: "string", description: 'Company scope only: the profile you refreshed (defaults to "default")' }, org: { type: "string" } }, required: ["provider"] } },
   { name: "packages_list", description: "List the products/packages this seat is entitled to on the portal, with current version (commit SHA) and local install state. The catalog is entitlement-scoped: only assigned packages appear.", inputSchema: { type: "object", properties: { org: { type: "string", description: "Org slug (optional when exactly one org is connected)" }, project_dir: { type: "string", description: "Cowork project folder (for install-state; defaults to cwd)" } }, required: [] } },
   { name: "package_install", description: "Install or update one entitled package into the Cowork project. The portal streams the content from our private repos server-side \u2014 no GitHub credential ever reaches this machine. Unpacks into <project>/.claude/skills/<slug> (or plugins/<slug> per the product), replacing any prior version; records the installed SHA in .claude/caddy-packages.json. Skips the download when already current (pass force to reinstall).", inputSchema: { type: "object", properties: { product: { type: "string", description: "Product slug from packages_list" }, org: { type: "string" }, project_dir: { type: "string", description: "Cowork project folder (defaults to cwd)" }, target_dir: { type: "string", description: "Override the install location" }, force: { type: "boolean", description: "Reinstall even when current" } }, required: ["product"] } },
@@ -6953,7 +6983,7 @@ var TOOLS = [
   { name: "generate_notion_status", description: "Check the progress/result of a generate_notion_graph refresh (which runs in the background because a full content pull takes minutes). Returns running / done (with summary) / failed.", inputSchema: { type: "object", properties: { project_dir: { type: "string" } }, required: ["project_dir"] } }
 ];
 async function main() {
-  const server = new Server({ name: "caddy-mcp", version: "0.4.8" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "caddy-mcp", version: "0.4.9" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;

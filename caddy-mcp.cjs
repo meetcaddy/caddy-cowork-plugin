@@ -5954,7 +5954,28 @@ async function generateNotionGraph(a) {
 `);
   const args = [NOTION_BUNDLE, "--token-file", tokenFile, "--out", dir, ...content ? ["--content"] : []];
   const fd = fs3.openSync(log, "a");
-  const child = (0, import_child_process.spawn)("node", args, { cwd: dir, detached: true, stdio: ["ignore", fd, fd], env: process.env });
+  const childEnv = { ELECTRON_RUN_AS_NODE: "1" };
+  for (const k of [
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "OPS_NS",
+    "CODE_NS"
+  ]) {
+    if (process.env[k] !== void 0) childEnv[k] = process.env[k];
+  }
+  const child = (0, import_child_process.spawn)(process.execPath, args, { cwd: dir, detached: true, stdio: ["ignore", fd, fd], env: childEnv });
   child.unref();
   fs3.closeSync(fd);
   return {
@@ -6932,7 +6953,7 @@ var TOOLS = [
   { name: "generate_notion_status", description: "Check the progress/result of a generate_notion_graph refresh (which runs in the background because a full content pull takes minutes). Returns running / done (with summary) / failed.", inputSchema: { type: "object", properties: { project_dir: { type: "string" } }, required: ["project_dir"] } }
 ];
 async function main() {
-  const server = new Server({ name: "caddy-mcp", version: "0.4.7" }, { capabilities: { tools: {} } });
+  const server = new Server({ name: "caddy-mcp", version: "0.4.8" }, { capabilities: { tools: {} } });
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;

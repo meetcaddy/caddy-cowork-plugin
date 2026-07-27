@@ -23,8 +23,8 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 
 // src/notion/snapshot.ts
-var fs2 = __toESM(require("fs"));
-var path2 = __toESM(require("path"));
+var fs3 = __toESM(require("fs"));
+var path3 = __toESM(require("path"));
 
 // src/lib/nq.ts
 var fs = __toESM(require("fs"));
@@ -77,6 +77,14 @@ var GraphWriter = class {
   get counts() {
     return { statements: this.lines.length };
   }
+  /** Emitted statements — read by delta mode to splice into an existing graph. */
+  get emitted() {
+    return this.lines;
+  }
+  /** Sanitized node-IRI prefix — needed by delta mode to match graph lines. */
+  get project() {
+    return this.proj;
+  }
   /** Atomic write into <root>/graphs/<platform>-<scopeId>.nq-style path. */
   write(outFile) {
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
@@ -86,6 +94,39 @@ var GraphWriter = class {
     return outFile;
   }
 };
+
+// src/lib/delta.ts
+var fs2 = __toESM(require("fs"));
+var path2 = __toESM(require("path"));
+function loadLatestManifest(outRoot, prefix) {
+  const dir = path2.join(outRoot, "snapshots");
+  if (!fs2.existsSync(dir)) return void 0;
+  const names = fs2.readdirSync(dir).filter((n) => n.startsWith(prefix)).sort().reverse();
+  for (const name of names) {
+    const file = path2.join(dir, name, "manifest.json");
+    if (!fs2.existsSync(file)) continue;
+    try {
+      return JSON.parse(fs2.readFileSync(file, "utf-8"));
+    } catch {
+    }
+  }
+  return void 0;
+}
+function parseRest(line, sEnd) {
+  const pStart = line.indexOf("<", sEnd + 1);
+  const pEnd = line.indexOf(">", pStart + 1);
+  const predicate = line.slice(pStart + 1, pEnd);
+  let object = null;
+  if (line[pEnd + 2] === "<") {
+    const oEnd = line.indexOf(">", pEnd + 3);
+    object = line.slice(pEnd + 3, oEnd);
+  }
+  return { predicate, object };
+}
+function bumpWatermark(wm, t) {
+  if (t && t > wm.watermark) wm.watermark = t;
+}
+var WATERMARK_SLACK_MS = 5 * 60 * 1e3;
 
 // src/lib/notion-oauth.ts
 var http = __toESM(require("http"));
@@ -186,23 +227,31 @@ function renderValue(prop) {
       return "";
   }
 }
-async function extractRecords(api2, dbId, cap, sleep2) {
+function rowFromPage(page, stampProp) {
+  const values = {};
+  let title = "";
+  for (const [name, prop] of Object.entries(page.properties || {})) {
+    const text = renderValue(prop);
+    if (prop.type === "title") title = text;
+    if (text) values[name] = text;
+  }
+  return {
+    id: page.id,
+    title: title || "(untitled)",
+    url: page.url,
+    values,
+    lastEdited: page.last_edited_time,
+    stamp: stampProp ? page.properties?.[stampProp]?.date?.start || void 0 : void 0
+  };
+}
+async function extractRecords(api2, dbId, cap, sleep2, stampProp) {
   const rows = [];
   let cursor;
   do {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
     const res = await api2("POST", `/databases/${dbId}/query`, body);
-    for (const page of res.results || []) {
-      const values = {};
-      let title = "";
-      for (const [name, prop] of Object.entries(page.properties || {})) {
-        const text = renderValue(prop);
-        if (prop.type === "title") title = text;
-        if (text) values[name] = text;
-      }
-      rows.push({ id: page.id, title: title || "(untitled)", url: page.url, values });
-    }
+    for (const page of res.results || []) rows.push(rowFromPage(page, stampProp));
     cursor = res.has_more ? res.next_cursor : void 0;
     await sleep2(200);
   } while (cursor && rows.length < cap);
@@ -261,11 +310,14 @@ var PAGE_CAP = 300;
 var DB_CAP = 500;
 var RECORD_CAP = 5e3;
 var CONTENT = process.argv.includes("--content") || process.argv.includes("--full");
+var SINCE = process.argv.includes("--since");
+var STAMP_BACKFILL = process.argv.includes("--stamp-backfill");
 var argv = process.argv.slice(2);
 function arg(name) {
   const i = argv.indexOf(`--${name}`);
   return i >= 0 ? argv[i + 1] : void 0;
 }
+var STAMP_PROP = arg("stamp-prop");
 function log(msg) {
   process.stderr.write(`[notion-snapshot] ${msg}
 `);
@@ -273,13 +325,15 @@ function log(msg) {
 var normId = (s) => String(s).toLowerCase().replace(/-/g, "");
 function idSet(file, label) {
   if (!file) return null;
-  const raw = JSON.parse(fs2.readFileSync(file, "utf-8"));
+  const raw = JSON.parse(fs3.readFileSync(file, "utf-8"));
   const ids = Array.isArray(raw) ? raw : raw.ids || [];
   log(`curation: ${label} list loaded (${ids.length} root ids)`);
   return new Set(ids.map(normId));
 }
 var sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+var API_CALLS = 0;
 async function api(method, endpoint, body) {
+  API_CALLS++;
   const res = await fetch(`${API}${endpoint}`, {
     method,
     headers: {
@@ -314,7 +368,301 @@ async function paginateSearch(filterValue, cap) {
 function plainTitle(rich) {
   return (rich || []).map((r) => r.plain_text || "").join("") || "(untitled)";
 }
+var rowStamp = (page) => STAMP_PROP ? page.properties?.[STAMP_PROP]?.date?.start || void 0 : void 0;
+function emitDatabase(g, root, db, hasDb) {
+  const dbId = db.id;
+  g.node(`database_${dbId}`, plainTitle(db.title), "NotionDatabase", {
+    notionId: dbId,
+    url: db.url,
+    inline: db.is_inline,
+    archived: db.archived
+  });
+  g.edge(root, `database_${dbId}`);
+  for (const [propName, prop] of Object.entries(db.properties || {})) {
+    const pid = `${dbId}_${prop.id}`;
+    const meta = { notionId: prop.id, propType: prop.type };
+    if (prop.type === "select" || prop.type === "multi_select" || prop.type === "status") {
+      meta.options = (prop[prop.type]?.options || []).map((o) => o.name).slice(0, 50);
+    }
+    if (prop.type === "formula") meta.expression = (prop.formula?.expression || "").slice(0, 200);
+    g.node(`property_${pid}`, propName, "NotionProperty", meta);
+    g.edge(`database_${dbId}`, `property_${pid}`);
+    const targetDb = prop.relation?.database_id;
+    if (targetDb && hasDb(targetDb)) {
+      g.edge(`property_${pid}`, `database_${targetDb}`, "relatedTo");
+    }
+    const rollupRel = prop.rollup?.relation_property_id;
+    if (rollupRel) g.edge(`property_${pid}`, `property_${dbId}_${rollupRel}`, "relatedTo");
+  }
+}
+function emitRecord(g, dbId, r) {
+  const body = Object.entries(r.values).map(([k, v]) => `${k}: ${v}`).join(" | ");
+  g.node(`record_${r.id}`, r.title, "NotionRecord", {
+    notionId: r.id,
+    url: r.url,
+    values: body,
+    ...Object.fromEntries(Object.entries(r.values).map(([k, v]) => [`v_${k.replace(/[^A-Za-z0-9]/g, "_")}`, v]))
+  });
+  g.edge(`database_${dbId}`, `record_${r.id}`);
+}
+async function emitPage(g, root, p, errors, skip) {
+  const meta = { notionId: p.id, url: p.url, archived: p.archived };
+  if (CONTENT) {
+    try {
+      const text = await extractPageText(api, p.id, sleep, skip ? { skip } : {});
+      if (text) meta.content = text;
+    } catch (e) {
+      errors[`page-content:${p.id}`] = String(e?.message).slice(0, 150);
+    }
+  }
+  g.node(`page_${p.id}`, plainTitle(p.properties?.title?.title || p.properties?.Name?.title), "NotionPage", meta);
+  g.edge(root, `page_${p.id}`);
+}
+async function searchChangedSince(thresholdIso) {
+  const changed = [];
+  let cursor;
+  let done = false;
+  do {
+    const body = { sort: { timestamp: "last_edited_time", direction: "descending" }, page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const res = await api("POST", "/search", body);
+    for (const r of res.results || []) {
+      if ((r.last_edited_time || "") > thresholdIso) changed.push(r);
+      else {
+        done = true;
+        break;
+      }
+    }
+    cursor = !done && res.has_more ? res.next_cursor : void 0;
+    if (cursor) await sleep(150);
+  } while (cursor);
+  return changed;
+}
+async function queryChangedRows(dbId, thresholdIso, stampLeg) {
+  const editedLeg = { timestamp: "last_edited_time", last_edited_time: { after: thresholdIso } };
+  const filter = stampLeg && STAMP_PROP ? { or: [editedLeg, { property: STAMP_PROP, date: { after: thresholdIso } }] } : editedLeg;
+  const rows = [];
+  let cursor;
+  do {
+    const body = { filter, page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+    const res = await api("POST", `/databases/${dbId}/query`, body);
+    rows.push(...res.results || []);
+    cursor = res.has_more ? res.next_cursor : void 0;
+    await sleep(200);
+  } while (cursor && rows.length < RECORD_CAP);
+  return rows;
+}
+async function deltaSweep(opts) {
+  const { slug, wsName, graphFile, snapDir, prevWatermark, prevStampDbs } = opts;
+  const t0 = Date.now();
+  const apiCalls0 = API_CALLS;
+  const thresholdIso = new Date(Date.parse(prevWatermark) - WATERMARK_SLACK_MS).toISOString();
+  log(`Delta mode: watermark ${prevWatermark} \u2014 fetching edits after ${thresholdIso}`);
+  const errors = {};
+  const wm = { watermark: prevWatermark };
+  const changed = await searchChangedSince(thresholdIso);
+  log(`  search: ${changed.length} changed objects`);
+  const changedDbs = /* @__PURE__ */ new Map();
+  const removedDbIds = /* @__PURE__ */ new Set();
+  const topPages = /* @__PURE__ */ new Map();
+  const recordPages = /* @__PURE__ */ new Map();
+  const removedPageIds = /* @__PURE__ */ new Set();
+  let skippedSubpages = 0;
+  for (const r of changed) {
+    bumpWatermark(wm, r.last_edited_time);
+    const gone = r.archived || r.in_trash;
+    if (r.object === "database") {
+      if (gone) removedDbIds.add(r.id);
+      else changedDbs.set(r.id, null);
+    } else if (r.object === "page") {
+      const pt = r.parent?.type;
+      if (gone) removedPageIds.add(r.id);
+      else if (pt === "workspace") topPages.set(r.id, r);
+      else if (pt === "database_id") recordPages.set(r.id, r);
+      else skippedSubpages++;
+    }
+  }
+  if (skippedSubpages) log(`  skipped ${skippedSubpages} nested sub-pages (not standalone graph entities in a full sweep)`);
+  for (const dbId of [...changedDbs.keys()]) {
+    try {
+      changedDbs.set(dbId, await api("GET", `/databases/${dbId}`));
+    } catch (e) {
+      errors[`database:${dbId}`] = String(e?.message).slice(0, 200);
+      changedDbs.delete(dbId);
+    }
+    await sleep(150);
+  }
+  const stampDbs = new Set(prevStampDbs);
+  if (STAMP_PROP) {
+    for (const [dbId, db] of changedDbs) {
+      if (db.properties?.[STAMP_PROP]) stampDbs.add(dbId);
+      else stampDbs.delete(dbId);
+    }
+  }
+  for (const dbId of removedDbIds) stampDbs.delete(dbId);
+  const processRow = (page) => {
+    bumpWatermark(wm, page.last_edited_time);
+    bumpWatermark(wm, rowStamp(page));
+    if (page.archived || page.in_trash) {
+      removedPageIds.add(page.id);
+      recordPages.delete(page.id);
+    } else {
+      recordPages.set(page.id, page);
+    }
+  };
+  if (CONTENT) {
+    for (const [dbId, db] of changedDbs) {
+      try {
+        const rows = await queryChangedRows(dbId, thresholdIso, !!(STAMP_PROP && db.properties?.[STAMP_PROP]));
+        rows.forEach(processRow);
+      } catch (e) {
+        errors[`records:${dbId}`] = String(e?.message).slice(0, 200);
+      }
+    }
+    for (const dbId of stampDbs) {
+      if (changedDbs.has(dbId)) continue;
+      try {
+        const rows = await queryChangedRows(dbId, thresholdIso, true);
+        rows.forEach(processRow);
+      } catch (e) {
+        errors[`stamp-records:${dbId}`] = String(e?.message).slice(0, 200);
+      }
+    }
+  } else if (recordPages.size) {
+    log(`  structure depth: ignoring ${recordPages.size} changed database rows (records exist only in --content graphs)`);
+    recordPages.clear();
+  }
+  const totalChanged = changedDbs.size + removedDbIds.size + topPages.size + recordPages.size + removedPageIds.size;
+  if (!totalChanged) {
+    log(`No changes since watermark \u2014 graph untouched (${API_CALLS - apiCalls0} API requests, ${((Date.now() - t0) / 1e3).toFixed(1)}s)`);
+    return;
+  }
+  const g = new GraphWriter("notion", slug, `notion_${slug}`);
+  const root = `workspace_${slug}`;
+  const containsPred = `${NS}contains`;
+  const dbTypeIri = `${NS}NotionDatabase`;
+  const recordIriPrefix = `${CODE}${g.project}_record_`;
+  const dropSubjects = /* @__PURE__ */ new Set();
+  const changedDbIris = /* @__PURE__ */ new Set();
+  const removedDbIris = /* @__PURE__ */ new Set();
+  const dropPageIris = /* @__PURE__ */ new Set();
+  const propPrefixes = [];
+  for (const dbId of changedDbs.keys()) {
+    const iri = g.iri(`database_${dbId}`);
+    dropSubjects.add(iri);
+    changedDbIris.add(iri);
+    propPrefixes.push(`${CODE}${g.project}_property_${sanitize(dbId)}_`);
+  }
+  for (const dbId of removedDbIds) {
+    const iri = g.iri(`database_${dbId}`);
+    dropSubjects.add(iri);
+    removedDbIris.add(iri);
+    propPrefixes.push(`${CODE}${g.project}_property_${sanitize(dbId)}_`);
+  }
+  for (const id of /* @__PURE__ */ new Set([...topPages.keys(), ...recordPages.keys(), ...removedPageIds])) {
+    for (const kind of ["page_", "record_"]) {
+      const iri = g.iri(kind + id);
+      dropSubjects.add(iri);
+      dropPageIris.add(iri);
+    }
+  }
+  const knownDbIris = new Set(changedDbIris);
+  const kept = [];
+  let dropped = 0;
+  for (const line of fs3.readFileSync(graphFile, "utf-8").split("\n")) {
+    if (!line) continue;
+    const sEnd = line.indexOf(">");
+    const subject = line.slice(1, sEnd);
+    let keep = true;
+    if (dropSubjects.has(subject)) {
+      if (changedDbIris.has(subject)) {
+        const { predicate, object } = parseRest(line, sEnd);
+        keep = predicate === containsPred && !!object && object.startsWith(recordIriPrefix) && !dropPageIris.has(object);
+      } else {
+        keep = false;
+      }
+    } else if (propPrefixes.some((p) => subject.startsWith(p))) {
+      keep = false;
+    } else {
+      const { predicate, object } = parseRest(line, sEnd);
+      if (object) {
+        if (predicate === RDF_TYPE && object === dbTypeIri) knownDbIris.add(subject);
+        if (dropPageIris.has(object) || removedDbIris.has(object)) keep = false;
+        else if (changedDbIris.has(object) && predicate === containsPred) keep = false;
+      }
+    }
+    if (keep) kept.push(line);
+    else dropped++;
+  }
+  const hasDb = (id) => knownDbIris.has(g.iri(`database_${id}`));
+  for (const db of changedDbs.values()) emitDatabase(g, root, db, hasDb);
+  let orphanRecords = 0;
+  for (const page of recordPages.values()) {
+    const dbId = page.parent?.database_id;
+    if (!dbId || !hasDb(dbId)) {
+      orphanRecords++;
+      continue;
+    }
+    emitRecord(g, dbId, rowFromPage(page, STAMP_PROP));
+  }
+  if (orphanRecords) log(`  skipped ${orphanRecords} changed records whose database is not in the graph`);
+  for (const p of topPages.values()) await emitPage(g, root, p, errors);
+  const out = kept.concat(g.emitted);
+  const tmp = graphFile + ".tmp";
+  fs3.writeFileSync(tmp, out.join("\n") + "\n");
+  fs3.renameSync(tmp, graphFile);
+  fs3.mkdirSync(snapDir, { recursive: true });
+  fs3.writeFileSync(path3.join(snapDir, "manifest.json"), JSON.stringify({
+    tool: "platform-graphs notion-snapshot",
+    version: 1,
+    generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+    workspace: wsName,
+    slug,
+    mode: "delta",
+    since: prevWatermark,
+    counts: {
+      databasesChanged: changedDbs.size,
+      recordsChanged: recordPages.size,
+      pagesChanged: topPages.size,
+      removed: removedDbIds.size + removedPageIds.size
+    },
+    linesDropped: dropped,
+    linesAppended: g.emitted.length,
+    statements: out.length,
+    watermark: wm.watermark,
+    stampProp: STAMP_PROP ?? null,
+    stampDbs: [...stampDbs],
+    errors
+  }, null, 2));
+  log(`Graph patched: ${graphFile}`);
+  log(`Delta done \u2014 ${changedDbs.size} databases, ${recordPages.size} records, ${topPages.size} pages refreshed; ${removedDbIds.size + removedPageIds.size} removed; ${dropped} lines dropped, ${g.emitted.length} appended (${API_CALLS - apiCalls0} API requests, ${((Date.now() - t0) / 1e3).toFixed(1)}s)`);
+}
 async function main() {
+  if (argv.includes("--help") || argv.includes("-h")) {
+    process.stdout.write(`Usage: notion-snapshot.cjs [options]
+
+  --oauth                 authorize via browser loopback (needs --client-id/--client-secret or env)
+  --client-id <id>        Notion OAuth client id (or NOTION_CLIENT_ID)
+  --client-secret <sec>   Notion OAuth client secret (or NOTION_CLIENT_SECRET)
+  --token-file <path>     read a saved access token (or NOTION_TOKEN env)
+  --token-out <path>      where --oauth saves the token (default: <out>/.notion-token)
+  --content | --full      content depth: database records + page body text
+  --since                 incremental refresh: fetch only entities edited since the last
+                          sweep's manifest watermark and patch the existing graph in place
+                          (falls back to a full sweep if no watermark/graph exists)
+  --stamp-prop <name>     operator-owned change-stamp Date property. Deltas OR it with
+                          the built-in last_edited_time (which does NOT advance on API
+                          property edits) and always re-query databases that carry it
+  --stamp-backfill        full sweep only: rows whose stamp property is empty get it
+                          initialized to the row's built-in last_edited_time (writes!)
+  --exclude <ids.json>    curation: drop these root ids (full sweep only)
+  --include <ids.json>    curation: keep ONLY these root ids (full sweep only)
+  --out <dir>             output root for graphs/ and snapshots/ (default: cwd)
+  --port <n>              OAuth loopback port (default: 8735)
+`);
+    return;
+  }
   let oauthWsName;
   if (argv.includes("--oauth")) {
     const clientId = process.env.NOTION_CLIENT_ID || arg("client-id");
@@ -327,16 +675,16 @@ async function main() {
     TOKEN = result.access_token;
     oauthWsName = result.workspace_name;
     log(`OAuth complete \u2014 workspace: ${result.workspace_name}`);
-    const tokenFile = arg("token-out") || path2.join(path2.resolve(arg("out") || "."), ".notion-token");
+    const tokenFile = arg("token-out") || path3.join(path3.resolve(arg("out") || "."), ".notion-token");
     try {
-      fs2.writeFileSync(tokenFile, result.access_token, { mode: 384 });
+      fs3.writeFileSync(tokenFile, result.access_token, { mode: 384 });
       log(`Access token saved: ${tokenFile} (reuse with --token-file, keep private)`);
     } catch {
     }
   }
   const tokenFileArg = arg("token-file");
-  if (!argv.includes("--oauth") && tokenFileArg && fs2.existsSync(tokenFileArg)) {
-    TOKEN = fs2.readFileSync(tokenFileArg, "utf-8").trim();
+  if (!argv.includes("--oauth") && tokenFileArg && fs3.existsSync(tokenFileArg)) {
+    TOKEN = fs3.readFileSync(tokenFileArg, "utf-8").trim();
     log(`Using saved access token from ${tokenFileArg}`);
   }
   if (!TOKEN) {
@@ -347,11 +695,10 @@ async function main() {
   const wsName = oauthWsName || me?.bot?.workspace_name || "workspace";
   const slug = wsName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "workspace";
   log(`Workspace: ${wsName} (${slug})`);
-  const outRoot = path2.resolve(arg("out") || ".");
+  const outRoot = path3.resolve(arg("out") || ".");
   const stamp = (/* @__PURE__ */ new Date()).toISOString().replace(/[:T]/g, "-").slice(0, 16);
-  const snapDir = path2.join(outRoot, "snapshots", `notion-${slug}-${stamp}`);
-  fs2.mkdirSync(snapDir, { recursive: true });
-  const errors = {};
+  const snapDir = path3.join(outRoot, "snapshots", `notion-${slug}-${stamp}`);
+  const graphFile = path3.join(outRoot, "graphs", `notion-${slug}.nq`);
   const excludeIds = idSet(arg("exclude"), "exclude");
   const includeIds = idSet(arg("include"), "include");
   const keepRoot = (id) => {
@@ -360,6 +707,29 @@ async function main() {
     if (includeIds && !includeIds.has(n)) return false;
     return true;
   };
+  if (SINCE) {
+    if (excludeIds || includeIds) {
+      log("--since: curation lists require a full sweep \u2014 running full so excluded entities cannot be patched back in");
+    } else {
+      const prev = loadLatestManifest(outRoot, `notion-${slug}-`);
+      if (!prev || !prev.watermark) {
+        log("--since: no watermark in the most recent manifest \u2014 falling back to full sweep");
+      } else if (!fs3.existsSync(graphFile)) {
+        log(`--since: graph file missing (${graphFile}) \u2014 falling back to full sweep`);
+      } else {
+        if (STAMP_PROP && !prev.stampDbs) {
+          log("--since: no stampDbs in manifest yet \u2014 stamp coverage limited to search-flagged databases until the next full sweep");
+        }
+        await deltaSweep({ slug, wsName, graphFile, snapDir, prevWatermark: prev.watermark, prevStampDbs: prev.stampDbs || [] });
+        return;
+      }
+    }
+  }
+  fs3.mkdirSync(snapDir, { recursive: true });
+  const errors = {};
+  const wm = { watermark: "" };
+  const stampDbs = [];
+  let backfilled = 0;
   log("Sweeping databases...");
   const dbStubs = (await paginateSearch("database", DB_CAP)).filter((s) => keepRoot(s.id));
   const databases = [];
@@ -396,72 +766,51 @@ async function main() {
   g.node(root, `Notion Workspace: ${wsName}`, "NotionWorkspace", { name: wsName });
   const dbIds = new Set(databases.map((d) => d.id));
   for (const db of databases) {
-    const dbId = db.id;
-    g.node(`database_${dbId}`, plainTitle(db.title), "NotionDatabase", {
-      notionId: dbId,
-      url: db.url,
-      inline: db.is_inline,
-      archived: db.archived
-    });
-    g.edge(root, `database_${dbId}`);
-    for (const [propName, prop] of Object.entries(db.properties || {})) {
-      const pid = `${dbId}_${prop.id}`;
-      const meta = { notionId: prop.id, propType: prop.type };
-      if (prop.type === "select" || prop.type === "multi_select" || prop.type === "status") {
-        meta.options = (prop[prop.type]?.options || []).map((o) => o.name).slice(0, 50);
-      }
-      if (prop.type === "formula") meta.expression = (prop.formula?.expression || "").slice(0, 200);
-      g.node(`property_${pid}`, propName, "NotionProperty", meta);
-      g.edge(`database_${dbId}`, `property_${pid}`);
-      const targetDb = prop.relation?.database_id;
-      if (targetDb && dbIds.has(targetDb)) {
-        g.edge(`property_${pid}`, `database_${targetDb}`, "relatedTo");
-      }
-      const rollupRel = prop.rollup?.relation_property_id;
-      if (rollupRel) g.edge(`property_${pid}`, `property_${dbId}_${rollupRel}`, "relatedTo");
-    }
+    bumpWatermark(wm, db.last_edited_time);
+    if (STAMP_PROP && db.properties?.[STAMP_PROP]) stampDbs.push(db.id);
+    emitDatabase(g, root, db, (id) => dbIds.has(id));
   }
   const dropId = (id) => excludeIds?.has(normId(id)) ?? false;
   for (const db of databases) {
     if (!CONTENT) break;
     try {
-      const rows = (await extractRecords(api, db.id, RECORD_CAP, sleep)).filter((r) => !dropId(r.id));
+      const rows = (await extractRecords(api, db.id, RECORD_CAP, sleep, STAMP_PROP)).filter((r) => !dropId(r.id));
       log(`  records: ${rows.length} in "${plainTitle(db.title)}"`);
+      const dbHasStamp = !!(STAMP_PROP && db.properties?.[STAMP_PROP]);
+      let filled = 0;
       for (const r of rows) {
-        const body = Object.entries(r.values).map(([k, v]) => `${k}: ${v}`).join(" | ");
-        g.node(`record_${r.id}`, r.title, "NotionRecord", {
-          notionId: r.id,
-          url: r.url,
-          values: body,
-          ...Object.fromEntries(Object.entries(r.values).map(([k, v]) => [`v_${k.replace(/[^A-Za-z0-9]/g, "_")}`, v]))
-        });
-        g.edge(`database_${db.id}`, `record_${r.id}`);
+        if (STAMP_BACKFILL && dbHasStamp && !r.stamp && r.lastEdited) {
+          try {
+            await api("PATCH", `/pages/${r.id}`, { properties: { [STAMP_PROP]: { date: { start: r.lastEdited } } } });
+            r.stamp = r.lastEdited;
+            r.values[STAMP_PROP] = r.lastEdited;
+            filled++;
+            backfilled++;
+            await sleep(150);
+          } catch (e) {
+            errors[`stamp-backfill:${r.id}`] = String(e?.message).slice(0, 150);
+          }
+        }
+        bumpWatermark(wm, r.lastEdited);
+        bumpWatermark(wm, r.stamp);
+        emitRecord(g, db.id, r);
       }
+      if (filled) log(`  stamp backfill: ${filled} rows initialized in "${plainTitle(db.title)}"`);
     } catch (e) {
       errors[`records:${db.id}`] = String(e?.message).slice(0, 200);
     }
   }
   for (const p of pages) {
-    const meta = { notionId: p.id, url: p.url, archived: p.archived };
-    if (CONTENT) {
-      try {
-        const text = await extractPageText(api, p.id, sleep, { skip: dropId });
-        if (text) meta.content = text;
-      } catch (e) {
-        errors[`page-content:${p.id}`] = String(e?.message).slice(0, 150);
-      }
-    }
-    g.node(`page_${p.id}`, plainTitle(p.properties?.title?.title || p.properties?.Name?.title), "NotionPage", meta);
-    g.edge(root, `page_${p.id}`);
+    bumpWatermark(wm, p.last_edited_time);
+    await emitPage(g, root, p, errors, dropId);
   }
   for (const u of users) {
     g.node(`user_${u.id}`, u.name || u.id, "NotionUser", { notionId: u.id, userType: u.type });
     g.edge(root, `user_${u.id}`);
   }
-  const graphFile = path2.join(outRoot, "graphs", `notion-${slug}.nq`);
   g.write(graphFile);
-  fs2.writeFileSync(path2.join(snapDir, "structure.json"), JSON.stringify({ databases, pages, users }, null, 1));
-  fs2.writeFileSync(path2.join(snapDir, "manifest.json"), JSON.stringify({
+  fs3.writeFileSync(path3.join(snapDir, "structure.json"), JSON.stringify({ databases, pages, users }, null, 1));
+  fs3.writeFileSync(path3.join(snapDir, "manifest.json"), JSON.stringify({
     tool: "platform-graphs notion-snapshot",
     version: 1,
     generatedAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -470,10 +819,14 @@ async function main() {
     counts: { databases: databases.length, pages: pages.length, users: users.length },
     curation: excludeIds || includeIds ? { excluded: excludeIds ? excludeIds.size : 0, includeOnly: includeIds ? includeIds.size : 0 } : null,
     statements: g.counts.statements,
+    watermark: wm.watermark || null,
+    stampProp: STAMP_PROP ?? null,
+    stampDbs,
+    backfilled,
     errors
   }, null, 2));
   log(`Graph emitted: ${graphFile}`);
-  log(`Done \u2014 ${databases.length} databases, ${pages.length} pages, ${users.length} users${Object.keys(errors).length ? `, ${Object.keys(errors).length} errors` : ""}`);
+  log(`Done \u2014 ${databases.length} databases, ${pages.length} pages, ${users.length} users${backfilled ? `, ${backfilled} stamps backfilled` : ""}${Object.keys(errors).length ? `, ${Object.keys(errors).length} errors` : ""}`);
 }
 main().catch((e) => {
   log(`FATAL: ${e?.message || e}`);
